@@ -1,0 +1,585 @@
+<?php
+require_once 'db.php';
+check_auth();
+
+$mysqli->set_charset('utf8mb4');
+
+// Set timezone to Pakistan (UTC+5) so created_at matches local time
+date_default_timezone_set('Asia/Karachi');
+$mysqli->query("SET time_zone = '+05:00'");
+
+// Ensure table exists
+$mysqli->query("CREATE TABLE IF NOT EXISTS bills (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    bill_number VARCHAR(100),
+    bill_date VARCHAR(50),
+    bill_time VARCHAR(50),
+    salesman VARCHAR(100),
+    sub_total DECIMAL(12,2) DEFAULT 0,
+    payment DECIMAL(12,2) DEFAULT 0,
+    change_amount DECIMAL(12,2) DEFAULT 0,
+    grand_total DECIMAL(12,2) DEFAULT 0,
+    total_profit DECIMAL(12,2) DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+
+$result = $mysqli->query("SHOW COLUMNS FROM bills LIKE 'total_profit'");
+if ($result && $result->num_rows === 0) {
+    $mysqli->query("ALTER TABLE bills ADD COLUMN total_profit DECIMAL(12,2) DEFAULT 0");
+}
+
+$discRes = $mysqli->query("SHOW COLUMNS FROM bills LIKE 'discount_percent'");
+if ($discRes && $discRes->num_rows === 0) {
+    $mysqli->query("ALTER TABLE bills ADD COLUMN discount_percent DECIMAL(5,2) DEFAULT 0");
+    $mysqli->query("ALTER TABLE bills ADD COLUMN discount_amount DECIMAL(12,2) DEFAULT 0");
+}
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS expenses (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    period_type VARCHAR(20) NOT NULL,
+    period_value VARCHAR(50) NOT NULL,
+    salesman_expense DECIMAL(12,2) DEFAULT 0,
+    shop_rent DECIMAL(12,2) DEFAULT 0,
+    other_expenses DECIMAL(12,2) DEFAULT 0,
+    UNIQUE KEY (user_id, period_type, period_value)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_expenses'])) {
+    $pType = $_POST['period_type'] ?? '';
+    $pValue = $_POST['period_value'] ?? '';
+    $sExp = floatval($_POST['salesman_expense'] ?? 0);
+    $rExp = floatval($_POST['shop_rent'] ?? 0);
+    $oExp = floatval($_POST['other_expenses'] ?? 0);
+    $uid = (int)$_SESSION['user_id'];
+    
+    $stmt = $mysqli->prepare("INSERT INTO expenses (user_id, period_type, period_value, salesman_expense, shop_rent, other_expenses) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE salesman_expense=VALUES(salesman_expense), shop_rent=VALUES(shop_rent), other_expenses=VALUES(other_expenses)");
+    $stmt->bind_param("issddd", $uid, $pType, $pValue, $sExp, $rExp, $oExp);
+    $stmt->execute();
+    
+    $redirectParams = $_GET;
+    $redirectUrl = "reports.php?" . http_build_query($redirectParams);
+    header("Location: " . $redirectUrl);
+    exit;
+}
+
+$filterType = $_GET['type'] ?? 'daily';
+$filterDate = $_GET['date'] ?? date('Y-m-d');
+$filterWeek = $_GET['week'] ?? date('Y-\WW');
+$filterMonth = $_GET['month'] ?? date('Y-m');
+$filterYear = $_GET['year'] ?? date('Y');
+$filterMetric = $_GET['metric'] ?? 'profit';
+
+$whereClause = "";
+$displayTitle = "Reports & Profit History";
+
+$user_id = (int)$_SESSION['user_id'];
+if ($filterType === 'daily') {
+    $whereClause = "WHERE DATE(created_at) = '" . $mysqli->real_escape_string($filterDate) . "' AND user_id = $user_id";
+    $displayTitle = "Daily Report for " . date('d M Y', strtotime($filterDate));
+} else if ($filterType === 'weekly') {
+    $yearWeek = str_replace('-W', '', $filterWeek);
+    $whereClause = "WHERE YEARWEEK(created_at, 3) = '" . $mysqli->real_escape_string($yearWeek) . "' AND user_id = $user_id";
+    $displayTitle = "Weekly Report for Week " . substr($filterWeek, -2) . ", " . substr($filterWeek, 0, 4);
+} else if ($filterType === 'monthly') {
+    $year = substr($filterMonth, 0, 4);
+    $month = substr($filterMonth, 5, 2);
+    $whereClause = "WHERE YEAR(created_at) = '" . $mysqli->real_escape_string($year) . "' AND MONTH(created_at) = '" . $mysqli->real_escape_string($month) . "' AND user_id = $user_id";
+    $displayTitle = "Monthly Report for " . date('F Y', strtotime($filterMonth . '-01'));
+} else if ($filterType === 'annual') {
+    $whereClause = "WHERE YEAR(created_at) = '" . $mysqli->real_escape_string($filterYear) . "' AND user_id = $user_id";
+    $displayTitle = "Annual Report for " . htmlspecialchars($filterYear);
+}
+
+$billsQuery = $mysqli->query("SELECT * FROM bills $whereClause ORDER BY created_at ASC"); // ASC for chronological chart
+
+$totalSales = 0;
+$totalProfit = 0;
+$chartData = [];
+$billsData = [];
+
+if($billsQuery && $billsQuery->num_rows > 0) {
+  while($bill = $billsQuery->fetch_assoc()) {
+    $totalSales += $bill['grand_total'];
+    $totalProfit += $bill['total_profit'];
+    
+    $dateStr = $bill['created_at'];
+    
+    if ($filterType === 'daily') {
+        $sortKey = strtotime($dateStr);
+        $label = date('h:i:s A', strtotime($dateStr)); // Exact second-by-second time
+    } else if ($filterType === 'weekly') {
+        $sortKey = date('Y-m-d', strtotime($dateStr));
+        $label = date('l, M d', strtotime($dateStr));
+    } else if ($filterType === 'monthly') {
+        $sortKey = date('Y-m-d', strtotime($dateStr));
+        $label = date('M d', strtotime($dateStr));
+    } else if ($filterType === 'annual') {
+        $sortKey = date('Y-m', strtotime($dateStr));
+        $label = date('F', strtotime($dateStr));
+    }
+    
+    if (!isset($chartData[$sortKey])) {
+        $chartData[$sortKey] = ['label' => $label, 'value' => 0];
+    }
+    $valToAdd = ($filterMetric === 'sales') ? $bill['grand_total'] : $bill['total_profit'];
+    $chartData[$sortKey]['value'] += $valToAdd;
+    
+    // Store bill to render later in descending order
+    array_unshift($billsData, $bill);
+  }
+}
+
+ksort($chartData);
+$chartLabels = [];
+$chartValues = [];
+$chartKeys = [];
+foreach ($chartData as $key => $data) {
+    $chartLabels[] = $data['label'];
+    $chartValues[] = $data['value'];
+    $chartKeys[] = $key;
+}
+
+$periodValue = '';
+if ($filterType === 'daily') $periodValue = $filterDate;
+else if ($filterType === 'weekly') $periodValue = $filterWeek;
+else if ($filterType === 'monthly') $periodValue = $filterMonth;
+else if ($filterType === 'annual') $periodValue = $filterYear;
+
+$salesmanExp = 0;
+$shopRent = 0;
+$otherExp = 0;
+
+$expenseQuery = $mysqli->prepare("SELECT salesman_expense, shop_rent, other_expenses FROM expenses WHERE user_id = ? AND period_type = ? AND period_value = ?");
+$expenseQuery->bind_param("iss", $user_id, $filterType, $periodValue);
+$expenseQuery->execute();
+$expResult = $expenseQuery->get_result();
+if ($expRow = $expResult->fetch_assoc()) {
+    $salesmanExp = (float)$expRow['salesman_expense'];
+    $shopRent = (float)$expRow['shop_rent'];
+    $otherExp = (float)$expRow['other_expenses'];
+}
+
+$totalGrossProfit = $totalProfit; 
+$purchaseCost = $totalSales - $totalGrossProfit;
+$totalOperatingExpenses = $salesmanExp + $shopRent + $otherExp;
+$netProfit = $totalGrossProfit - $totalOperatingExpenses;
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sales Reports - Aslam Malik Store</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter', sans-serif; background: #f4f7f6; color: #333; }
+.app-header { background: #0f172a; color: white; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+.app-header h1 { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; margin: 0; }
+.app-header a { color: white; text-decoration: none; background: #3b82f6; padding: 6px 12px; border-radius: 4px; font-weight: 600; font-size: 14px; }
+.app-header a:hover { background: #2563eb; }
+.container { max-width: 1100px; margin: 30px auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+h2 { margin-bottom: 20px; color: #0f172a; font-size: 22px; }
+
+.filters { display: flex; gap: 15px; margin-bottom: 20px; align-items: center; background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0; }
+.filters select, .filters input, .filters button { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 14px; outline: none; }
+.filters select:focus, .filters input:focus { border-color: #3b82f6; }
+.filters button { background: #10b981; color: white; border: none; font-weight: 600; cursor: pointer; }
+.filters button:hover { background: #059669; }
+
+.summary-cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; margin-bottom: 30px; }
+.card { background: #fff; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 2px 5px rgba(0,0,0,0.02); display: flex; flex-direction: column; }
+.card-title { font-size: 14px; color: #64748b; font-weight: 600; margin-bottom: 10px; text-transform: uppercase; }
+.card-value { font-size: 28px; font-weight: 700; color: #0f172a; }
+.card.profit-card { background: #f0fdf4; border-color: #bbf7d0; }
+.card.profit-card .card-value { color: #16a34a; }
+
+.table-wrapper { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+.table th { background: #f8fafc; font-weight: 600; color: #0f172a; }
+
+.btn-view { background: #6366f1; color: white; border: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; }
+.btn-view:hover { background: #4f46e5; }
+.details-row { display: none; background: #f8fafc; }
+.details-container { padding: 15px; border: 1px dashed #cbd5e1; border-radius: 6px; margin: 5px 0; background: white; }
+.details-table { width: 100%; border-collapse: collapse; }
+.details-table th, .details-table td { padding: 8px; border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+.details-table th { background: #f1f5f9; font-weight: 600; }
+
+@media screen and (max-width: 768px) {
+  .app-header { flex-direction: column; gap: 10px; text-align: center; }
+  .app-header a { width: 100%; text-align: center; padding: 12px; }
+  .filters { flex-direction: column; align-items: stretch; gap: 10px; }
+  .filters select, .filters input, .filters button { width: 100%; padding: 12px; font-size: 16px; }
+  .summary-cards { grid-template-columns: 1fr; }
+  .container { margin: 10px; padding: 15px; }
+  .chart-container { height: 300px !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <h1>
+    Sales & Profit Reports
+  </h1>
+  <div style="display:flex; gap:10px; align-items:center;">
+    <a href="khata.php" style="background:#0f766e; color:white; text-decoration:none; padding:6px 12px; border-radius:4px; font-weight:600; font-size:14px; display:inline-flex; align-items:center; gap:5px;">📒 Khata (Credit)</a>
+    <a href="bill.php">🔙 Back to POS</a>
+  </div>
+</div>
+
+<div class="container">
+  <h2>📈 <?= htmlspecialchars($displayTitle) ?></h2>
+  
+  
+
+  <div class="summary-cards">
+    <div class="card">
+      <div class="card-title">Total Sales (Revenue)</div>
+      <div class="card-value">Rs. <?= number_format($totalSales, 2) ?></div>
+      <div style="font-size:12px; color:#64748b; margin-top:5px; padding-top:5px; border-top:1px dashed #e2e8f0;">Purchase Cost: Rs. <?= number_format($purchaseCost, 2) ?></div>
+      <div style="font-size:12px; color:#16a34a; font-weight:600;">Gross Profit: Rs. <?= number_format($totalGrossProfit, 2) ?></div>
+    </div>
+    <div class="card" style="background: #fef2f2; border-color: #fca5a5;">
+      <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+        <span>Operating Expenses</span>
+        <button onclick="document.getElementById('expense-modal').style.display='flex'" style="background:#ef4444; color:white; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">Edit</button>
+      </div>
+      <div class="card-value" style="color: #dc2626;">Rs. <?= number_format($totalOperatingExpenses, 2) ?></div>
+      <div style="font-size:12px; color:#ef4444; margin-top:5px; padding-top:5px; border-top:1px dashed #fca5a5; line-height:1.4;">
+        Salesman: Rs. <?= number_format($salesmanExp, 2) ?><br>
+        Shop Rent: Rs. <?= number_format($shopRent, 2) ?><br>
+        Other: Rs. <?= number_format($otherExp, 2) ?>
+      </div>
+    </div>
+    <div class="card profit-card">
+      <div class="card-title">Net Profit</div>
+      <div class="card-value">Rs. <?= number_format($netProfit, 2) ?></div>
+      <div style="font-size:12px; color:#16a34a; margin-top:5px; padding-top:5px; border-top:1px dashed #bbf7d0;">After all expenses deducted</div>
+    </div>
+  </div>
+
+  <div id="expense-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:2000; align-items:center; justify-content:center;">
+    <div style="background:white; padding:25px; border-radius:12px; width:400px; max-width:90%;">
+      <h3 style="margin-bottom:15px; font-size:18px; color:#0f172a;">Edit Expenses for this Period</h3>
+      <form method="POST">
+        <input type="hidden" name="period_type" value="<?= htmlspecialchars($filterType) ?>">
+        <input type="hidden" name="period_value" value="<?= htmlspecialchars($periodValue) ?>">
+        <div style="margin-bottom:15px;">
+          <label style="display:block; margin-bottom:5px; font-size:13px; font-weight:600; color:#475569;">Salesman Expense (Rs.)</label>
+          <input type="number" step="0.01" name="salesman_expense" value="<?= htmlspecialchars($salesmanExp) ?>" style="width:100%; padding:10px; border-radius:6px; border:1px solid #cbd5e1; outline:none;">
+        </div>
+        <div style="margin-bottom:15px;">
+          <label style="display:block; margin-bottom:5px; font-size:13px; font-weight:600; color:#475569;">Shop Rent (Rs.)</label>
+          <input type="number" step="0.01" name="shop_rent" value="<?= htmlspecialchars($shopRent) ?>" style="width:100%; padding:10px; border-radius:6px; border:1px solid #cbd5e1; outline:none;">
+        </div>
+        <div style="margin-bottom:20px;">
+          <label style="display:block; margin-bottom:5px; font-size:13px; font-weight:600; color:#475569;">Other Expenses (Rs.)</label>
+          <input type="number" step="0.01" name="other_expenses" value="<?= htmlspecialchars($otherExp) ?>" style="width:100%; padding:10px; border-radius:6px; border:1px solid #cbd5e1; outline:none;">
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:10px;">
+          <button type="button" onclick="document.getElementById('expense-modal').style.display='none'" style="background:#e2e8f0; color:#475569; border:none; padding:8px 16px; border-radius:6px; font-weight:600; cursor:pointer;">Cancel</button>
+          <button type="submit" name="save_expenses" style="background:#10b981; color:white; border:none; padding:8px 16px; border-radius:6px; font-weight:600; cursor:pointer;">Save Expenses</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="chart-container" style="position: relative; height: 400px; background: white; padding: 20px; border-radius: 12px; margin-bottom: 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+    <canvas id="reportChart"></canvas>
+  </div>
+
+  <div class="table-wrapper">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Bill #</th>
+          <th>Date & Time</th>
+          <th>Salesman</th>
+          <th>Total Sale</th>
+          <th>Total Profit</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php if(!empty($billsData)): ?>
+          <?php foreach($billsData as $bill): ?>
+            <tr>
+              <td><strong><?= htmlspecialchars($bill['bill_number']) ?></strong></td>
+              <td><?= htmlspecialchars($bill['bill_date']) ?> <?= htmlspecialchars($bill['bill_time']) ?></td>
+              <td><?= htmlspecialchars($bill['salesman']) ?></td>
+              <td>
+                Rs. <?= number_format($bill['grand_total'], 2) ?>
+                <?php if (isset($bill['discount_percent']) && floatval($bill['discount_percent']) > 0): ?>
+                  <span style="font-size:11px; background:#fef3c7; color:#b45309; padding:2px 6px; border-radius:10px; font-weight:700; margin-left:4px;">-<?= rtrim(rtrim(number_format($bill['discount_percent'], 2), '0'), '.') ?>%</span>
+                <?php endif; ?>
+              </td>
+              <td style="color: #16a34a; font-weight: 600;">Rs. <?= number_format($bill['total_profit'], 2) ?></td>
+              <td>
+                <button class="btn-view" onclick="toggleDetails(<?= $bill['id'] ?>)">View Items</button>
+                <button class="btn-view" style="background:#ef4444; margin-left:5px;" onclick="deleteBill(<?= $bill['id'] ?>)">🗑️ Delete</button>
+              </td>
+            </tr>
+            <tr id="details-<?= $bill['id'] ?>" class="details-row">
+              <td colspan="6" style="padding: 0;">
+                <div class="details-container">
+                  <?php if (isset($bill['discount_percent']) && floatval($bill['discount_percent']) > 0): ?>
+                    <div style="display:flex; justify-content:space-between; background:#fffbeb; border:1px solid #fde68a; padding:8px 12px; border-radius:6px; margin-bottom:10px; font-size:13px; color:#92400e;">
+                      <span><strong>Subtotal:</strong> Rs. <?= number_format($bill['sub_total'], 2) ?></span>
+                      <span><strong>Discount (<?= rtrim(rtrim(number_format($bill['discount_percent'], 2), '0'), '.') ?>%):</strong> -Rs. <?= number_format($bill['discount_amount'] ?? ($bill['sub_total'] - $bill['grand_total']), 2) ?></span>
+                      <span><strong>Grand Total:</strong> Rs. <?= number_format($bill['grand_total'], 2) ?></span>
+                      <span><strong>Paid:</strong> Rs. <?= number_format($bill['payment'], 2) ?> (Change: Rs. <?= number_format($bill['change_amount'], 2) ?>)</span>
+                    </div>
+                  <?php endif; ?>
+                  <?php
+                    $itemsQuery = $mysqli->query("SELECT * FROM bill_items WHERE bill_id = " . intval($bill['id']));
+                  ?>
+                  <table class="details-table">
+                    <thead>
+                      <tr>
+                        <th style="width: 25%;">Item Description</th>
+                        <th style="width: 10%;">Size</th>
+                        <th style="width: 12%;">Price</th>
+                        <th style="width: 8%;">Qty</th>
+                        <th style="width: 10%;">Disc%</th>
+                        <th style="width: 13%;">Total Amt</th>
+                        <th style="width: 12%;">Profit</th>
+                        <th style="width: 10%;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <?php if($itemsQuery && $itemsQuery->num_rows > 0): ?>
+                        <?php while($item = $itemsQuery->fetch_assoc()): ?>
+                        <tr>
+                          <td>
+                            <div style="display:flex; align-items:center; gap:8px;">
+                              <?php if(!empty($item['image'])): ?>
+                                <img src="<?= htmlspecialchars($item['image']) ?>" alt="" style="width:28px; height:28px; object-fit:cover; border-radius:4px; border:1px solid #cbd5e1; flex-shrink:0; cursor:pointer;" onclick="window.open('<?= htmlspecialchars($item['image']) ?>', '_blank')" title="Click to view photo">
+                              <?php endif; ?>
+                              <span><?= htmlspecialchars($item['description']) ?></span>
+                            </div>
+                          </td>
+                          <td><?= htmlspecialchars($item['size']) ?></td>
+                          <td>Rs. <?= number_format($item['price'], 2) ?></td>
+                          <td><?= htmlspecialchars($item['quantity']) ?></td>
+                          <td><?= (isset($item['discount_percent']) && floatval($item['discount_percent']) > 0) ? '<span style="color:#b45309; font-weight:700;">' . htmlspecialchars($item['discount_percent']) . '%</span>' : '-' ?></td>
+                          <td>Rs. <?= number_format($item['amount'], 2) ?></td>
+                          <td style='color: #16a34a;'>Rs. <?= number_format($item['profit'] ?? 0, 2) ?></td>
+                          <td><button class="btn-view" style="background:#f59e0b; padding: 4px 8px;" onclick="changeReportItem(<?= $item['id'] ?>, '<?= addslashes($item['description']) ?>', <?= $item['price'] ?>, <?= $item['quantity'] ?>, <?= floatval($item['discount_percent'] ?? 0) ?>)">Edit</button></td>
+                        </tr>
+                        <?php endwhile; ?>
+                      <?php else: ?>
+                        <tr><td colspan="8" style="text-align:center; color:#64748b;">No items recorded.</td></tr>
+                      <?php endif; ?>
+                    </tbody>
+                  </table>
+                </div>
+              </td>
+            </tr>
+          <?php endforeach; ?>
+        <?php else: ?>
+          <tr><td colspan="6" style="text-align: center; padding: 30px; color: #64748b;">No records found for this period.</td></tr>
+        <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function toggleFilter() {
+    var type = document.getElementById('filterType').value;
+    var sels = {
+        'daily': document.getElementById('filterDate'),
+        'weekly': document.getElementById('filterWeek'),
+        'monthly': document.getElementById('filterMonth'),
+        'annual': document.getElementById('filterYear')
+    };
+    
+    for (var key in sels) {
+        if (key === type) {
+            sels[key].style.display = 'inline-block';
+            sels[key].disabled = false;
+        } else {
+            sels[key].style.display = 'none';
+            sels[key].disabled = true;
+        }
+    }
+}
+
+function toggleDetails(id) {
+    var el = document.getElementById('details-' + id);
+    if (el.style.display === 'table-row') {
+        el.style.display = 'none';
+    } else {
+        el.style.display = 'table-row';
+    }
+}
+
+function changeReportItem(id, currentDesc, currentPrice, currentQty, currentDisc = 0) {
+    const newDesc = prompt("Change Item Description:", currentDesc);
+    if (newDesc === null) return;
+    
+    const newPrice = prompt("Change Price:", currentPrice);
+    if (newPrice === null) return;
+    
+    const newQty = prompt("Change Quantity:", currentQty);
+    if (newQty === null) return;
+
+    const newDisc = prompt("Change Item Discount (%):", currentDisc);
+    if (newDisc === null) return;
+    
+    fetch('update_bill_item.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            id: id,
+            description: newDesc,
+            price: parseFloat(newPrice),
+            quantity: parseInt(newQty),
+            discount_percent: parseFloat(newDisc) || 0
+        })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert("Item updated successfully!");
+            location.reload();
+        } else {
+            alert("Error: " + data.error);
+        }
+    })
+    .catch(err => alert("Failed to update item."));
+}
+
+function deleteBill(id) {
+    if(!confirm('Are you sure you want to completely delete this bill and its records?')) return;
+    fetch('delete_bill.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: id })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if(data.status === 'success') {
+            location.reload();
+        } else {
+            alert('Error deleting bill: ' + data.error);
+        }
+    })
+    .catch(err => alert('Network error'));
+}
+
+// Render Chart
+const chartLabels = <?= json_encode($chartLabels) ?>;
+const chartValues = <?= json_encode($chartValues) ?>;
+const chartKeys = <?= json_encode($chartKeys) ?>;
+
+if (chartLabels.length > 0) {
+    const ctx = document.getElementById('reportChart').getContext('2d');
+    
+    let gradient = ctx.createLinearGradient(0, 0, 0, 400);
+    gradient.addColorStop(0, 'rgba(16, 185, 129, 0.8)');
+    gradient.addColorStop(1, 'rgba(16, 185, 129, 0.2)');
+
+    // Use a line chart specifically for second-by-second (daily) data
+    const chartType = '<?= $filterType === "daily" ? "line" : "bar" ?>';
+
+    new Chart(ctx, {
+        type: chartType,
+        data: {
+            labels: chartLabels,
+            datasets: [{
+                label: '<?= $filterMetric === "sales" ? "Total Sales (Rs.)" : "Profit (Rs.)" ?>',
+                data: chartValues,
+                backgroundColor: gradient,
+                borderColor: '#10b981',
+                borderWidth: 2,
+                borderRadius: 6,
+                borderSkipped: false,
+                barPercentage: 0.6,
+                pointBackgroundColor: '#ffffff',
+                pointBorderColor: '#10b981',
+                pointBorderWidth: 3,
+                pointRadius: 8, // Very large so single points are highly visible
+                pointHoverRadius: 12,
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            onClick: (e, activeEls) => {
+                if (activeEls.length > 0) {
+                    const dataIndex = activeEls[0].index;
+                    const clickedKey = chartKeys[dataIndex];
+                    const currentType = '<?= $filterType ?>';
+                    const currentMetric = '<?= $filterMetric ?>';
+                    
+                    if (currentType === 'weekly' || currentType === 'monthly') {
+                        // Drill down to second-by-second Daily view
+                        window.location.href = `reports.php?type=daily&date=${clickedKey}&metric=${currentMetric}`;
+                    } else if (currentType === 'annual') {
+                        // Drill down to Monthly view
+                        window.location.href = `reports.php?type=monthly&month=${clickedKey}&metric=${currentMetric}`;
+                    }
+                }
+            },
+            interaction: {
+                mode: 'index',
+                intersect: false,
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                    titleFont: { size: 14, family: "'Inter', sans-serif" },
+                    bodyFont: { size: 14, family: "'Inter', sans-serif" },
+                    padding: 12,
+                    cornerRadius: 8,
+                    displayColors: false,
+                    callbacks: {
+                        label: function(context) {
+                            return '<?= $filterMetric === "sales" ? "Sales" : "Profit" ?>: Rs. ' + context.parsed.y.toLocaleString(undefined, {minimumFractionDigits: 2});
+                        }
+                    }
+                },
+                title: { 
+                    display: true, 
+                    text: '<?= $filterMetric === "sales" ? "Sales Trend Over Time" : "Profit Trend Over Time" ?>',
+                    font: { size: 16, family: "'Inter', sans-serif", weight: '600' },
+                    color: '#0f172a',
+                    padding: { top: 10, bottom: 20 }
+                }
+            },
+            scales: {
+                y: { 
+                    beginAtZero: true,
+                    grid: { color: '#f1f5f9', drawBorder: false },
+                    ticks: {
+                        font: { family: "'Inter', sans-serif", size: 12 },
+                        color: '#64748b',
+                        callback: function(value) { return 'Rs. ' + value; }
+                    }
+                },
+                x: {
+                    grid: { display: false, drawBorder: false },
+                    ticks: {
+                        font: { family: "'Inter', sans-serif", size: 12 },
+                        color: '#64748b'
+                    }
+                }
+            }
+        }
+    });
+} else {
+    document.querySelector('.chart-container').style.display = 'none';
+}
+</script>
+
+</body>
+</html>
